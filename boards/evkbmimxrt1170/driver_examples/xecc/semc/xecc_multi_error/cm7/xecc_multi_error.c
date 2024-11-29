@@ -12,6 +12,7 @@
 #include "board.h"
 #include "fsl_semc.h"
 #include "fsl_xecc.h"
+#include "fsl_pit.h"
 
 /*******************************************************************************
  * Definitions
@@ -102,7 +103,7 @@ void EXAMPLE_XECC_IRQ_HANDLER(void)
 /*!
  * @brief Main function
  */
-int main(void)
+int main1(void)
 {
     uint32_t multiErrorData;
     uint32_t uncorrectedData;
@@ -132,6 +133,7 @@ int main(void)
     config.enableXECC     = true;
     config.enableWriteECC = true;
     config.enableReadECC  = true;
+    //config.enableSwap = true;
 
     /* Set ECC regions */
     config.Region0BaseAddress = EXAMPLE_SEMC_START_ADDRESS;
@@ -162,8 +164,9 @@ int main(void)
     XECC_EnableInterrupts(EXAMPLE_XECC, kXECC_MultiErrorInterruptStatusEnable);
 
     multiErrorData       = 0x03;
-    sdram_writeBuffer[0] = 0xDDCCBBAAU;
-    uncorrectedData      = 0xDDCCBBA9U;
+    //multiErrorData       = 0x08040201;
+    sdram_writeBuffer[0] = 0xDDCCBBAA;
+    uncorrectedData      = 0xDDCCBBA9;
 
     /* Multiple error injection. */
     XECC_ErrorInjection(EXAMPLE_XECC, multiErrorData, 0);
@@ -227,3 +230,170 @@ int main(void)
     {
     }
 }
+
+#define PIT PIT1
+
+void life_timer_init(void)
+{
+    // PIT clock gate control ON
+    CLOCK_EnableClock(kCLOCK_Pit1);
+
+    pit_config_t pitConfig;
+    PIT_GetDefaultConfig(&pitConfig);
+    // Init pit module
+    PIT_Init(PIT, &pitConfig);
+    // Set max timer period for channel 1
+    PIT_SetTimerPeriod(PIT, kPIT_Chnl_1, (uint32_t)~0);
+    // Disable timer interrupts for channel 1
+    PIT_DisableInterrupts(PIT, kPIT_Chnl_1, kPIT_TimerInterruptEnable);
+    // Clear timer channel 1 flag
+    PIT_ClearStatusFlags(PIT, kPIT_Chnl_1, kPIT_TimerFlag);
+    // Chain timer channel 1 to channel 0
+    PIT_SetTimerChainMode(PIT, kPIT_Chnl_1, true);
+    // Start timer channel 1
+    PIT_StartTimer(PIT, kPIT_Chnl_1);
+
+    // Set max timer period for channel 0
+    PIT_SetTimerPeriod(PIT, kPIT_Chnl_0, (uint32_t)~0);
+    // Clear timer channel 0 flag
+    PIT_ClearStatusFlags(PIT, kPIT_Chnl_0, kPIT_TimerFlag);
+    // Start timer channel 0
+    PIT_StartTimer(PIT, kPIT_Chnl_0);
+}
+
+uint64_t life_timer_clock(void)
+{
+#if defined(FSL_FEATURE_PIT_HAS_LIFETIME_TIMER) && (FSL_FEATURE_PIT_HAS_LIFETIME_TIMER == 1)
+    // Note: first read LTMR64H and then LTMR64L. LTMR64H will have the value
+    //  of CVAL1 at the time of the first access, LTMR64L will have the value of CVAL0 at the
+    //  time of the first access, therefore the application does not need to worry about carry-over
+    //  effects of the running counter.
+    return ~PIT_GetLifetimeTimerCount(PIT);
+#else
+    uint64_t valueH;
+    volatile uint32_t valueL;
+    // Make sure that there are no rollover of valueL.
+    // Because the valueL always decreases, so, if the formal valueL is greater than
+    // current value, that means the valueH is updated during read valueL.
+    // In this case, we need to re-update valueH and valueL.
+    do
+    {
+        valueL = PIT_GetCurrentTimerCount(PIT, kPIT_Chnl_0);
+        valueH = PIT_GetCurrentTimerCount(PIT, kPIT_Chnl_1);
+    } while (valueL < PIT_GetCurrentTimerCount(PIT, kPIT_Chnl_0));
+
+    // Invert to turn into an up counter
+    return ~((valueH << 32) | valueL);
+#endif // FSL_FEATURE_PIT_HAS_LIFETIME_TIMER
+}
+
+static uint32_t normalReadError;
+static uint32_t xeccReadError, xeccSwapReadError;
+
+uint32_t readErrorCnt = 0;
+uint32_t get_sdram_rw_block_time(uint32_t start, uint32_t size)
+{
+    uint64_t tickStart = life_timer_clock();
+    readErrorCnt = 0;
+    for (uint32_t idx = 0; idx < size; idx += 4)
+    {
+    	*((uint32_t*)(start + idx)) = idx;
+    }
+    for (uint32_t idx = 0; idx < size; idx += 4)
+    {
+        uint32_t temp = *((uint32_t*)(start + idx));
+    	if (temp != idx)
+    	{
+    		readErrorCnt++;
+    	}
+    }
+    uint64_t tickEnd = life_timer_clock();
+    return ((tickEnd - tickStart) / (CLOCK_GetRootClockFreq(kCLOCK_Root_Bus) / 1000000));
+}
+
+void test_xecc_sdram_perf(uint32_t size)
+{
+    /* Get default configuration */
+    xecc_config_t config;
+    XECC_GetDefaultConfig(&config);
+    /* Enable ECC function for write and read */
+    config.enableXECC     = true;
+    config.enableWriteECC = true;
+    config.enableReadECC  = true;
+    config.Region0BaseAddress = 0x80040000;
+    config.Region0EndAddress  = 0x800C0000;
+    XECC_Deinit(EXAMPLE_XECC);
+    /* Write/Read/Compare test at normal SDRAM memory region */
+    uint32_t normalTimeInUs = get_sdram_rw_block_time(0x80000000, size);
+    normalReadError = readErrorCnt;
+    /* Write/Read/Compare test at XECC enabled SDRAM memory region */
+    config.enableSwap = false;
+    XECC_Init(XECC_SEMC, &config);
+    uint32_t xeccNoSwapTimeInUs = get_sdram_rw_block_time(0x80040000, size);
+    xeccReadError = readErrorCnt;
+    /* Write/Read/Compare test at XECC enabled SDRAM memory region */
+    XECC_Deinit(XECC_SEMC);
+    config.enableSwap = true;
+    XECC_Init(XECC_SEMC, &config);
+    uint32_t xeccSwapTimeInUs = get_sdram_rw_block_time(0x80040000, size);
+    xeccSwapReadError = readErrorCnt;
+
+    PRINTF("---------------------------------------\r\n");
+    PRINTF("Write/Read/Compare data size: %d\r\n", size);
+    PRINTF("Write/Read/Compare time in SDRAM region XECC disable : %d us\r\n", normalTimeInUs);
+    PRINTF("Write/Read/Compare time in SDRAM region XECC enable without data swap : %d us\r\n", xeccNoSwapTimeInUs);
+    PRINTF("Write/Read/Compare time in SDRAM region XECC enable with data swap : %d us\r\n", xeccSwapTimeInUs);
+    if (normalReadError || xeccReadError || xeccSwapReadError)
+    {
+        PRINTF("Number of Write/Read/Compare errors in XECC disable SDRAM region : %d\r\n", normalReadError);
+        PRINTF("Number of Write/Read/Compare errors in XECC enable no swap SDRAM region : %d\r\n", xeccReadError);
+        PRINTF("Number of Write/Read/Compare errors in XECC enable with swap SDRAM region : %d\r\n", xeccSwapReadError);
+    }
+}
+
+int main(void)
+{
+    /* Hardware initialize. */
+    BOARD_ConfigMPU();
+    BOARD_InitPins();
+    BOARD_BootClockRUN_800M();
+    BOARD_InitDebugConsole();
+
+    PRINTF("XECC Performance Test Start!\r\n");
+    if (BOARD_InitSEMC() != kStatus_Success)
+    {
+        PRINTF("\r\n SEMC SDRAM Init Failed\r\n");
+        while(1);
+    }
+
+    PRINTF("CM7 core clock: %d\r\n", SystemCoreClock);
+    uint32_t semcClock = CLOCK_GetRootClockFreq(kCLOCK_Root_Semc);
+    PRINTF("SEMC root clock: %d\r\n", semcClock);
+
+    life_timer_init();
+
+    PRINTF("\r\nL1 D-Cache is enabled.\r\n");
+    test_xecc_sdram_perf(0x10000);
+    test_xecc_sdram_perf(0x20000);
+    test_xecc_sdram_perf(0x40000);
+    
+#if defined(CACHE_MAINTAIN) && CACHE_MAINTAIN
+    // Disable D cache to avoid cache pre-fetch more data from external memory, which include ECC data.
+    //   Otherwise, XECC will decode ECC data itself and generate another error interrupt.
+#if (defined __CORTEX_M) && (__CORTEX_M == 7U)
+    SCB_DisableDCache();
+#elif (defined __CORTEX_M) && (__CORTEX_M == 4U)
+    L1CACHE_DisableSystemCache();
+#endif
+#endif
+
+    PRINTF("\r\nL1 D-Cache is disabled.\r\n");
+    test_xecc_sdram_perf(0x10000);
+    test_xecc_sdram_perf(0x20000);
+    test_xecc_sdram_perf(0x40000);
+
+    while (1)
+    {
+    }
+}
+
